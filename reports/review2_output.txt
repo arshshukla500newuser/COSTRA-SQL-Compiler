@@ -1,0 +1,44 @@
+
+======================================================================
+REVIEW 2 — CORE IMPLEMENTATION WALKTHROUGH
+======================================================================
+Representative SQL:
+  SELECT e.name, e.salary FROM Employee e WHERE e.salary > 80000 ORDER BY e.salary DESC LIMIT 3;
+
+1. LEXER: 26 tokens recognised.
+   First tokens: SELECT IDENTIFIER DOT IDENTIFIER COMMA IDENTIFIER DOT IDENTIFIER FROM IDENTIFIER IDENTIFIER WHERE IDENTIFIER DOT IDENTIFIER OPERATOR NUMBER ORDER BY IDENTIFIER DOT IDENTIFIER DESC LIMIT NUMBER SEMICOL
+
+2. PARSER / AST: SQL syntax accepted.
+SELECT
+  SELECT_ITEM
+    COLUMN e.name
+  SELECT_ITEM
+    COLUMN e.salary
+  FROM Employee AS e
+  WHERE
+    BINARY >
+      COLUMN e.salary
+      LITERAL 80000
+  ORDER BY
+    COLUMN e.salary DESC
+  LIMIT 3
+
+3. SEMANTIC ANALYSIS: all referenced names passed validation.
+   e -> Employee
+
+4. RELATIONAL IR: logical operators before choosing a physical implementation.
+PROJECT [e.name, e.salary]
+  LIMIT [3]
+    SORT [e.salary DESC]
+      FILTER [(e.salary > 80000)]
+        TABLE_SCAN [Employee AS e]
+
+5. EXECUTION CHECK: this prototype can then pass normalized SQL to SQLite.
+name | salary
+Ishita | 91000
+Arjun | 85000
+Rows returned: 2
+
+REVIEW 2 OUTPUT
+  Working lexer, parser/AST, semantic validation, relational IR, plan estimates,
+  sample execution, and module-level evidence. The next milestone integrates and validates the whole system.

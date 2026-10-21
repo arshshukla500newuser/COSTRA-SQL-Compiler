@@ -1,0 +1,37 @@
+
+======================================================================
+COST CALCULATION & BEST ESTIMATED PLAN
+======================================================================
+WORKED ACCESS-PATH EXAMPLE
+SQL: SELECT e.name FROM Employee e WHERE e.salary > 60000;
+Synthetic Employee rows N = 10,000
+Estimated selectivity = 0.7200  →  output rows ≈ 7,200
+
+Full scan + predicate
+  N + (0.20 × N) = 10,000 + (0.20 × 10,000) = 12,000.00
+
+Index scan
+  2 × log2(max(2, N)) + (0.60 × output_rows)
+  2 × log2(10,000) + (0.60 × 7,200) = 4,346.58
+
+Access-path decision: INDEX SCAN has the lower estimate.
+
+FULL MULTI-JOIN QUERY — CANDIDATE PLAN COMPARISON
+  Plan 1: 115,222.63 model units; rows ≈ 2.00
+  Plan 2: 115,222.63 model units; rows ≈ 2.00
+  Plan 3: 121,702.63 model units; rows ≈ 2.00
+  Plan 4: 121,702.63 model units; rows ≈ 2.00
+  Plan 5: 123,862.63 model units; rows ≈ 2.00
+  Plan 6: 123,862.63 model units; rows ≈ 2.00
+
+Lowest estimate: 115,222.63 model units
+Lowest-cost candidate(s): Plan 1, Plan 2
+Selection rule: choose the candidate with the minimum estimated total cost.
+Tie note: the first minimum candidate in enumeration order is returned; the tied plan has the same estimated cost.
+
+JOIN COST FORMULAS USED
+  Nested loop = 0.15 × L × max(1, R)
+  Hash join   = 1.10 × (L + R) + 0.25 × min(L, R)
+  Merge join  = 0.80 × (L + R) + 0.45L log2(max(2,L)) + 0.45R log2(max(2,R))
+
+These are synthetic relative model units. They are not elapsed time and are not passed to SQLite.

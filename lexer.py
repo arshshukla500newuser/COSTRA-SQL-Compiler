@@ -1,14 +1,14 @@
-import re
+"""Lexer for the SQL subset supported by COSTRA."""
+from __future__ import annotations
 from dataclasses import dataclass
-
+import re
 
 KEYWORDS = {
-    "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT",
-    "FULL", "OUTER", "ON", "AND", "OR", "NOT", "GROUP", "BY",
-    "HAVING", "ORDER", "ASC", "DESC", "LIMIT", "AS", "DISTINCT",
-    "COUNT", "SUM", "AVG", "MIN", "MAX", "NULL", "TRUE", "FALSE"
+    "SELECT", "DISTINCT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "OUTER",
+    "ON", "AND", "OR", "NOT", "GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "LIMIT",
+    "AS", "COUNT", "SUM", "AVG", "MIN", "MAX", "IS", "NULL", "LIKE", "IN", "BETWEEN",
+    "TRUE", "FALSE", "CROSS",
 }
-
 
 @dataclass(frozen=True)
 class Token:
@@ -20,9 +20,9 @@ class Token:
 
 TOKEN_SPEC = [
     ("COMMENT", r"--[^\n]*"),
-    ("NUMBER", r"\d+(?:\.\d+)?"),
+    ("NUMBER", r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"),
     ("STRING", r"'(?:''|[^'])*'"),
-    ("OPERATOR", r"<>|!=|<=|>=|=|<|>|\+|-|\*|/|%"),
+    ("OPERATOR", r"!=|<>|<=|>=|=|<|>|\+|-|\*|/|%"),
     ("COMMA", r","),
     ("DOT", r"\."),
     ("LPAREN", r"\("),
@@ -32,109 +32,31 @@ TOKEN_SPEC = [
     ("SKIP", r"[ \t\r\n]+"),
     ("MISMATCH", r"."),
 ]
+MASTER = re.compile("|".join(f"(?P<{kind}>{pattern})" for kind, pattern in TOKEN_SPEC))
 
 
-MASTER = re.compile(
-    "|".join(
-        f"(?P<{kind}>{pattern})"
-        for kind, pattern in TOKEN_SPEC
-    )
-)
-
-
-def tokenize(sql):
-
+def tokenize(sql: str) -> list[Token]:
     if not isinstance(sql, str):
         raise TypeError("SQL input must be a string")
-
-    tokens = []
-
+    tokens: list[Token] = []
     line = 1
     line_start = 0
-
     for match in MASTER.finditer(sql):
-
-        kind = match.lastgroup
+        kind = match.lastgroup or "MISMATCH"
         value = match.group()
-
         column = match.start() - line_start + 1
-
         if kind in ("COMMENT", "SKIP"):
-
             newline_count = value.count("\n")
-
             if newline_count:
                 line += newline_count
-
-                last_newline = value.rfind("\n")
-
-                line_start = (
-                    match.start()
-                    + last_newline
-                    + 1
-                )
-
+                line_start = match.start() + value.rfind("\n") + 1
             continue
-
-        if kind == "IDENTIFIER":
-
-            upper_value = value.upper()
-
-            if upper_value in KEYWORDS:
-                kind = upper_value
-
+        if kind == "IDENTIFIER" and value.upper() in KEYWORDS:
+            kind = value.upper()
         if kind == "MISMATCH":
-
-            raise SyntaxError(
-                f"Lexical error at line {line}, "
-                f"column {column}: "
-                f"unexpected character {value!r}"
+            raise ValueError(
+                f"Lexical error at line {line}, column {column}: unexpected character {value!r}"
             )
-
-        tokens.append(
-            Token(
-                kind=kind,
-                value=value,
-                line=line,
-                column=column
-            )
-        )
-
-    tokens.append(
-        Token(
-            kind="EOF",
-            value="",
-            line=line,
-            column=1
-        )
-    )
-
+        tokens.append(Token(kind, value, line, column))
+    tokens.append(Token("EOF", "", line, len(sql.rsplit("\n", 1)[-1]) + 1))
     return tokens
-
-
-if __name__ == "__main__":
-
-    sql = """
-    SELECT
-        d.name AS department,
-        COUNT(e.id) AS employee_count,
-        AVG(e.salary) AS average_salary
-    FROM Employee e
-    JOIN Department d
-        ON e.dept_id = d.id
-    WHERE e.salary > 60000
-    GROUP BY d.name
-    HAVING AVG(e.salary) > 65000
-    ORDER BY AVG(e.salary) DESC
-    LIMIT 5;
-    """
-
-    tokens = tokenize(sql)
-
-    for token in tokens:
-        print(
-            f"{token.kind:<12} "
-            f"{token.value!r:<20} "
-            f"line={token.line:<3} "
-            f"column={token.column}"
-        )

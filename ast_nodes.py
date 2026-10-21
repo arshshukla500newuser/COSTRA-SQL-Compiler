@@ -1,338 +1,168 @@
+"""Abstract syntax tree nodes and safe SQL pretty-printing for COSTRA's SQL subset."""
+from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, Any
+from typing import Any, Optional
 
 
-@dataclass
+@dataclass(frozen=True)
 class ColumnRef:
     name: str
     table: Optional[str] = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Literal:
     value: Any
 
 
-@dataclass
+@dataclass(frozen=True)
 class BinaryExpr:
     left: Any
     operator: str
     right: Any
 
 
-@dataclass
+@dataclass(frozen=True)
 class UnaryExpr:
     operator: str
     operand: Any
 
 
-@dataclass
+@dataclass(frozen=True)
+class IsNullExpr:
+    expression: Any
+    negated: bool = False
+
+
+@dataclass(frozen=True)
+class InExpr:
+    expression: Any
+    values: tuple[Any, ...]
+    negated: bool = False
+
+
+@dataclass(frozen=True)
+class BetweenExpr:
+    expression: Any
+    lower: Any
+    upper: Any
+    negated: bool = False
+
+
+@dataclass(frozen=True)
 class FunctionCall:
     name: str
-    arguments: list = field(default_factory=list)
-
-    def __post_init__(self):
-        self.name = self.name.upper()
+    argument: Any
+    distinct: bool = False
 
 
-@dataclass
+@dataclass(frozen=True)
 class SelectItem:
     expression: Any
     alias: Optional[str] = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class TableRef:
     name: str
     alias: Optional[str] = None
 
+    @property
+    def reference_name(self) -> str:
+        return self.alias or self.name
 
-@dataclass
+
+@dataclass(frozen=True)
 class JoinClause:
     table: TableRef
     condition: Any
     join_type: str = "INNER"
 
-    def __post_init__(self):
-        self.join_type = self.join_type.upper()
 
-
-@dataclass
+@dataclass(frozen=True)
 class OrderItem:
     expression: Any
     direction: str = "ASC"
 
-    def __post_init__(self):
-        self.direction = self.direction.upper()
-
 
 @dataclass
 class SelectQuery:
-    select_items: list = field(default_factory=list)
-    from_table: Optional[TableRef] = None
-    joins: list = field(default_factory=list)
+    columns: list[SelectItem] = field(default_factory=list)
+    table: Optional[TableRef] = None
+    joins: list[JoinClause] = field(default_factory=list)
     where: Optional[Any] = None
-    group_by: list = field(default_factory=list)
+    group_by: list[Any] = field(default_factory=list)
     having: Optional[Any] = None
-    order_by: list = field(default_factory=list)
+    order_by: list[OrderItem] = field(default_factory=list)
     limit: Optional[int] = None
     distinct: bool = False
 
-    @property
-    def columns(self):
-        return self.select_items
 
-    @columns.setter
-    def columns(self, value):
-        self.select_items = value
-
-    @property
-    def table(self):
-        return self.from_table
-
-    @table.setter
-    def table(self, value):
-        self.from_table = value
-
-
-def format_expr(expression):
-
-    if isinstance(expression, ColumnRef):
-
-        if expression.name == "*":
-
-            if expression.table:
-                return f"{expression.table}.*"
-
-            return "*"
-
-        if expression.table:
-            return f"{expression.table}.{expression.name}"
-
-        return expression.name
-
-    if isinstance(expression, Literal):
-
-        if expression.value is None:
+def format_expr(node: Any) -> str:
+    if isinstance(node, ColumnRef):
+        if node.name == "*":
+            return f"{node.table}.*" if node.table else "*"
+        return f"{node.table}.{node.name}" if node.table else node.name
+    if isinstance(node, Literal):
+        if node.value is None:
             return "NULL"
-
-        if expression.value is True:
-            return "TRUE"
-
-        if expression.value is False:
-            return "FALSE"
-
-        if isinstance(expression.value, str):
-
-            return (
-                "'"
-                + expression.value.replace("'", "''")
-                + "'"
-            )
-
-        return str(expression.value)
-
-    if isinstance(expression, BinaryExpr):
-
-        return (
-            f"({format_expr(expression.left)} "
-            f"{expression.operator} "
-            f"{format_expr(expression.right)})"
-        )
-
-    if isinstance(expression, UnaryExpr):
-
-        if expression.operator.upper() == "NOT":
-
-            return (
-                f"(NOT "
-                f"{format_expr(expression.operand)})"
-            )
-
-        return (
-            f"({expression.operator}"
-            f"{format_expr(expression.operand)})"
-        )
-
-    if isinstance(expression, FunctionCall):
-
-        arguments = ", ".join(
-            format_expr(argument)
-            for argument in expression.arguments
-        )
-
-        return f"{expression.name}({arguments})"
-
-    return str(expression)
+        if isinstance(node.value, bool):
+            return "TRUE" if node.value else "FALSE"
+        if isinstance(node.value, str):
+            return "'" + node.value.replace("'", "''") + "'"
+        return str(node.value)
+    if isinstance(node, BinaryExpr):
+        return f"({format_expr(node.left)} {node.operator} {format_expr(node.right)})"
+    if isinstance(node, UnaryExpr):
+        if node.operator in ("+", "-"):
+            return f"({node.operator}{format_expr(node.operand)})"
+        return f"({node.operator} {format_expr(node.operand)})"
+    if isinstance(node, IsNullExpr):
+        return f"({format_expr(node.expression)} IS {'NOT ' if node.negated else ''}NULL)"
+    if isinstance(node, InExpr):
+        vals = ", ".join(format_expr(v) for v in node.values)
+        return f"({format_expr(node.expression)} {'NOT ' if node.negated else ''}IN ({vals}))"
+    if isinstance(node, BetweenExpr):
+        return (f"({format_expr(node.expression)} {'NOT ' if node.negated else ''}BETWEEN "
+                f"{format_expr(node.lower)} AND {format_expr(node.upper)})")
+    if isinstance(node, FunctionCall):
+        arg = "*" if node.argument == "*" else format_expr(node.argument)
+        distinct = "DISTINCT " if node.distinct else ""
+        return f"{node.name.upper()}({distinct}{arg})"
+    return str(node)
 
 
-def format_query(query):
-
-    parts = ["SELECT"]
-
-    if query.distinct:
-        parts.append("DISTINCT")
-
-    columns = query.select_items
-
-    parts.append(
-        ", ".join(
-            (
-                format_expr(item.expression)
-                + (
-                    f" AS {item.alias}"
-                    if item.alias
-                    else ""
-                )
-            )
-            for item in columns
-        )
-    )
-
-    parts.append("FROM")
-
-    table = query.from_table
-
-    parts.append(table.name)
-
-    if table.alias:
-        parts.append(table.alias)
-
+def format_query(query: SelectQuery) -> str:
+    """Render the AST back to a single SELECT statement accepted by SQLite."""
+    if query.table is None:
+        raise ValueError("Cannot format a SELECT without a FROM table")
+    select = "SELECT DISTINCT" if query.distinct else "SELECT"
+    projection = []
+    for item in query.columns:
+        piece = format_expr(item.expression)
+        if item.alias:
+            piece += f" AS {item.alias}"
+        projection.append(piece)
+    parts = [select, ", ".join(projection), "FROM", query.table.name]
+    if query.table.alias:
+        parts += ["AS", query.table.alias]
     for join in query.joins:
-
-        parts.append(join.join_type)
-        parts.append("JOIN")
-        parts.append(join.table.name)
-
+        join_type = join.join_type.upper()
+        parts += [join_type, "JOIN", join.table.name]
         if join.table.alias:
-            parts.append(join.table.alias)
-
-        parts.append("ON")
-        parts.append(
-            format_expr(join.condition)
-        )
-
+            parts += ["AS", join.table.alias]
+        if join_type != "CROSS":
+            parts += ["ON", format_expr(join.condition)]
     if query.where is not None:
-
-        parts.append("WHERE")
-        parts.append(
-            format_expr(query.where)
-        )
-
+        parts += ["WHERE", format_expr(query.where)]
     if query.group_by:
-
-        parts.append("GROUP")
-        parts.append("BY")
-
-        parts.append(
-            ", ".join(
-                format_expr(x)
-                for x in query.group_by
-            )
-        )
-
+        parts += ["GROUP BY", ", ".join(format_expr(item) for item in query.group_by)]
     if query.having is not None:
-
-        parts.append("HAVING")
-        parts.append(
-            format_expr(query.having)
-        )
-
+        parts += ["HAVING", format_expr(query.having)]
     if query.order_by:
-
-        parts.append("ORDER")
-        parts.append("BY")
-
-        parts.append(
-            ", ".join(
-                f"{format_expr(item.expression)} "
-                f"{item.direction}"
-                for item in query.order_by
-            )
-        )
-
+        parts += ["ORDER BY", ", ".join(
+            f"{format_expr(item.expression)} {item.direction.upper()}" for item in query.order_by
+        )]
     if query.limit is not None:
-
-        parts.append("LIMIT")
-        parts.append(str(query.limit))
-
+        parts += ["LIMIT", str(query.limit)]
     return " ".join(parts) + ";"
-
-
-def print_ast(query):
-
-    print("\n" + "=" * 80)
-    print("ABSTRACT SYNTAX TREE")
-    print("=" * 80)
-
-    print("SELECT")
-
-    for item in query.select_items:
-
-        print(
-            f"  {format_expr(item.expression)}"
-            + (
-                f" AS {item.alias}"
-                if item.alias
-                else ""
-            )
-        )
-
-    print(
-        f"FROM {query.from_table.name}"
-        + (
-            f" {query.from_table.alias}"
-            if query.from_table.alias
-            else ""
-        )
-    )
-
-    for join in query.joins:
-
-        print(
-            f"{join.join_type} JOIN "
-            f"{join.table.name}"
-        )
-
-        print(
-            "  ON "
-            + format_expr(join.condition)
-        )
-
-    if query.where:
-
-        print(
-            "WHERE "
-            + format_expr(query.where)
-        )
-
-    if query.group_by:
-
-        print(
-            "GROUP BY "
-            + ", ".join(
-                format_expr(x)
-                for x in query.group_by
-            )
-        )
-
-    if query.having:
-
-        print(
-            "HAVING "
-            + format_expr(query.having)
-        )
-
-    if query.order_by:
-
-        print(
-            "ORDER BY "
-            + ", ".join(
-                f"{format_expr(x.expression)} "
-                f"{x.direction}"
-                for x in query.order_by
-            )
-        )
-
-    if query.limit is not None:
-        print(f"LIMIT {query.limit}")

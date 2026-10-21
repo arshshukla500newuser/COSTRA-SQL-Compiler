@@ -1,0 +1,27 @@
+
+======================================================================
+REVIEW 1 — PROBLEM DEFINITION & SYSTEM DESIGN
+======================================================================
+PROBLEM
+  SQL queries hide the internal steps that transform source text into a validated
+  query plan. COSTRA makes those steps visible for learning and demonstration.
+
+OBJECTIVES
+  1. Tokenize a documented subset of SQL.
+  2. Parse tokens into an AST and validate table/alias/column references.
+  3. Build a relational logical plan.
+  4. Estimate alternative access paths and join orders.
+  5. Execute the normalized query separately through SQLite.
+
+SCOPE
+  SELECT, joins, filters, grouping, HAVING, sorting, LIMIT, and supported
+  aggregate expressions. COSTRA is an educational SQL compiler/optimizer prototype,
+  not a full SQL implementation or a production database engine.
+
+DESIGNED PIPELINE
+  SQL → Lexer → Parser/AST → Semantic Analysis → Relational IR
+      → Cardinality & Selectivity → Candidate Plans → Cost Comparison
+      → Normalized SQL → SQLite Results
+
+REVIEW 1 OUTPUT
+  Problem statement, objectives, scope, architecture, methodology, and prototype plan.

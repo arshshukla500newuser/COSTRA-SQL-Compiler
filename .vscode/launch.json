@@ -1,0 +1,36 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "COSTRA — Interactive Professor Menu",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "COSTRA — Full Review 3 Demo",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": ["--demo"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "COSTRA — Cost Calculation",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": ["--cost-demo"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "COSTRA — Semantic Error Demo",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": ["--error-demo"],
+      "console": "integratedTerminal"
+    }
+  ]
+}

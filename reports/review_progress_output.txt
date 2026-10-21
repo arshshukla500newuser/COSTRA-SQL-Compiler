@@ -1,0 +1,25 @@
+
+======================================================================
+COSTRA — REVIEW-WISE PROGRESS
+======================================================================
+REVIEW 1 | DESIGN
+  • Problem statement, motivation, objectives and supported SQL scope
+  • Architecture, methodology and compiler-stage mapping
+  • Output: approved plan for implementation
+
+REVIEW 2 | CORE IMPLEMENTATION
+  • Lexer and parser/AST
+  • Semantic checks and relational IR
+  • Candidate-plan generation, synthetic cost estimates and SQLite-backed demo
+  • Output: working core modules and implementation evidence
+
+REVIEW 3 | INTEGRATION & VALIDATION
+  • User-provided SQL through the full pipeline
+  • Worked cost formulas and lowest-cost candidate selection
+  • SQLite results and its separate EXPLAIN QUERY PLAN
+  • Error handling, regression tests, benchmark evidence and documentation
+  • Output: complete educational prototype and final submission package
+
+IMPORTANT
+  The three reviews are milestones, not separate compilers. The final demo connects
+  the modules into one visible workflow. Cost values are model units, not milliseconds.

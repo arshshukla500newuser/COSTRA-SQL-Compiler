@@ -1,668 +1,325 @@
-from itertools import permutations
+"""Educational cost-based optimizer for COSTRA.
 
-from ir import PlanNode
-from statistics import (
-    table_rows,
-    predicate_selectivity,
-    get_column_stats
+The optimizer creates estimated candidate plans and selects the minimum estimated
+cost. SQLite independently executes the normalized SQL; COSTRA does not inject its
+chosen plan into SQLite's internal planner.
+"""
+from __future__ import annotations
+import itertools
+import math
+from ast_nodes import (
+    BetweenExpr, BinaryExpr, ColumnRef, FunctionCall, InExpr, IsNullExpr,
+    Literal, UnaryExpr, format_expr,
 )
-from schema import (
-    has_index,
-    get_row_count
-)
+from ir import PlanNode, build_logical_plan, contains_aggregate
+from schema import INDEXES, SCHEMA, STATS, canonical_table_name
+from statistics import referenced_aliases, selectivity
+
+
+def split_conjuncts(expression):
+    if isinstance(expression, BinaryExpr) and expression.operator.upper() == "AND":
+        return split_conjuncts(expression.left) + split_conjuncts(expression.right)
+    return [expression] if expression is not None else []
+
+
+def combine_conjuncts(expressions):
+    if not expressions:
+        return None
+    current = expressions[0]
+    for expr in expressions[1:]:
+        current = BinaryExpr(current, "AND", expr)
+    return current
+
+
+def _column_refs(expression):
+    from semantic import walk_expression
+    return [part for part in walk_expression(expression) if isinstance(part, ColumnRef) and part.name != "*"]
 
 
 class CostModel:
+    """Consistent relative cost units; not wall-clock milliseconds."""
+    def full_scan(self, rows: float) -> float:
+        return rows * 1.0
 
-    def __init__(self):
-        # Cost weights
-        self.io_weight = 1.0
-        self.cpu_weight = 0.5
-        self.memory_weight = 0.2
-        self.network_weight = 0.1
+    def index_scan(self, table_rows: float, output_rows: float) -> float:
+        # Index descent + leaf visits/output fetches in simplified relative units.
+        return math.log2(max(2.0, table_rows)) * 2.0 + output_rows * 0.60
 
-    # ---------------------------------------------------------
-    # TABLE SCAN COST
-    # ---------------------------------------------------------
+    def predicate(self, input_rows: float) -> float:
+        return input_rows * 0.20
 
-    def sequential_scan_cost(self, rows):
-        io_cost = rows * self.io_weight
-        cpu_cost = rows * self.cpu_weight
+    def nested_loop_join(self, left_rows: float, right_rows: float) -> float:
+        return left_rows * max(1.0, right_rows) * 0.15
 
-        return io_cost + cpu_cost
+    def hash_join(self, left_rows: float, right_rows: float) -> float:
+        return (left_rows + right_rows) * 1.10 + min(left_rows, right_rows) * 0.25
 
-    def index_scan_cost(self, rows):
-        # Educational approximation of index access.
-        io_cost = max(1.0, rows * 0.25)
-        cpu_cost = rows * 0.15
+    def merge_join(self, left_rows: float, right_rows: float) -> float:
+        sort_left = left_rows * math.log2(max(2.0, left_rows)) * 0.45
+        sort_right = right_rows * math.log2(max(2.0, right_rows)) * 0.45
+        return (left_rows + right_rows) * 0.80 + sort_left + sort_right
 
-        return io_cost + cpu_cost
+    def aggregate(self, rows: float) -> float:
+        return rows * 0.45
 
-    # ---------------------------------------------------------
-    # FILTER COST
-    # ---------------------------------------------------------
+    def distinct(self, rows: float) -> float:
+        return rows * 0.30
 
-    def filter_cost(self, input_rows, output_rows):
-        cpu_cost = input_rows * self.cpu_weight
+    def sort(self, rows: float) -> float:
+        return rows * math.log2(max(2.0, rows)) * 0.35
 
-        memory_cost = output_rows * self.memory_weight
-
-        return cpu_cost + memory_cost
-
-    # ---------------------------------------------------------
-    # JOIN COSTS
-    # ---------------------------------------------------------
-
-    def nested_loop_cost(self, left_rows, right_rows):
-        cpu = left_rows * right_rows * self.cpu_weight
-
-        io = (left_rows + right_rows) * self.io_weight
-
-        return cpu + io
-
-    def hash_join_cost(self, left_rows, right_rows):
-        cpu = (left_rows + right_rows) * self.cpu_weight
-
-        memory = min(left_rows, right_rows) * self.memory_weight
-
-        return cpu + memory
-
-    def merge_join_cost(self, left_rows, right_rows):
-        sort_left = left_rows * 0.6
-        sort_right = right_rows * 0.6
-
-        merge = (left_rows + right_rows) * 0.3
-
-        return sort_left + sort_right + merge
-
-    # ---------------------------------------------------------
-    # SORT
-    # ---------------------------------------------------------
-
-    def sort_cost(self, rows):
-        if rows <= 1:
-            return 0.0
-
-        return rows * 0.8
-
-    # ---------------------------------------------------------
-    # AGGREGATION
-    # ---------------------------------------------------------
-
-    def aggregate_cost(self, rows):
-        return rows * 0.6
+    def project(self, rows: float) -> float:
+        return rows * 0.05
 
 
 class Optimizer:
-
-    def __init__(self, query=None):
-
-        self.query = query
+    def __init__(self, max_candidates: int = 6, max_join_orders: int = 720):
         self.cost_model = CostModel()
+        self.max_candidates = max_candidates
+        self.max_join_orders = max_join_orders
 
-        self.table_aliases = {}
-        self.table_rows = {}
+    def optimize(self, query):
+        logical = build_logical_plan(query)
+        candidates = self.enumerate_plans(query)
+        if not candidates:
+            raise ValueError("The optimizer could not generate a candidate plan")
+        best = min(candidates, key=lambda plan: plan.cost)
+        return logical, candidates, best
 
-    # =========================================================
-    # PUBLIC OPTIMIZATION FUNCTION
-    # =========================================================
+    def _alias_map(self, query):
+        refs = ([query.table] if query.table else []) + [join.table for join in query.joins]
+        mapping = {}
+        for ref in refs:
+            table = canonical_table_name(ref.name)
+            if table:
+                mapping[(ref.alias or ref.name).casefold()] = table
+        return mapping
 
-    def optimize(self, query=None):
+    def _base_scans(self, query, aliases):
+        predicates = split_conjuncts(query.where)
+        local = {alias: [] for alias in aliases}
+        remaining = []
+        for predicate in predicates:
+            refs = referenced_aliases(predicate, aliases)
+            if len(refs) == 1 and next(iter(refs)) in local:
+                local[next(iter(refs))].append(predicate)
+            else:
+                remaining.append(predicate)
 
-        if query is not None:
-            self.query = query
+        scans = {}
+        for ref in ([query.table] if query.table else []) + [join.table for join in query.joins]:
+            alias_key = (ref.alias or ref.name).casefold()
+            table = aliases.get(alias_key, canonical_table_name(ref.name) or ref.name)
+            table_stats = STATS.get(table, {"rows": 1000, "columns": {}})
+            input_rows = float(table_stats["rows"])
+            selectivity_fraction = 1.0
+            for predicate in local.get(alias_key, []):
+                selectivity_fraction *= selectivity(predicate, aliases)
+            selectivity_fraction = max(0.0, min(1.0, selectivity_fraction))
+            output_rows = max(1.0, input_rows * selectivity_fraction)
+            predicate = combine_conjuncts(local.get(alias_key, []))
 
-        if self.query is None:
-            raise ValueError("No SQL query supplied to optimizer.")
+            full_cost = self.cost_model.full_scan(input_rows)
+            if predicate is not None:
+                full_cost += self.cost_model.predicate(input_rows)
+            indexed = self._indexed_predicate_columns(predicate, ref, table)
+            index_cost = self.cost_model.index_scan(input_rows, output_rows) if indexed else float("inf")
+            if index_cost < full_cost:
+                op = "INDEX_SCAN"
+                cost = index_cost
+                algorithm = "INDEX"
+            else:
+                op = "TABLE_SCAN"
+                cost = full_cost
+                algorithm = "FULL_SCAN"
+            detail = f"{table}" + (f" AS {ref.alias}" if ref.alias else "")
+            if indexed and op == "INDEX_SCAN":
+                detail += f"; indexed predicate on {', '.join(indexed)}"
+            if predicate is not None:
+                detail += f"; pushed filter: {format_expr(predicate)}"
+            scans[alias_key] = PlanNode(op, detail=detail, rows=output_rows, cost=cost, algorithm=algorithm)
+        return scans, remaining
 
-        self.build_metadata()
+    def _indexed_predicate_columns(self, predicate, ref, table):
+        if predicate is None:
+            return []
+        available = {col.casefold(): col for indexed_table, col in INDEXES if indexed_table.casefold() == table.casefold()}
+        found = []
+        # Inspect each conjunct independently so a predicate such as
+        # salary > 60000 AND experience >= 5 can still use a relevant index.
+        for term in split_conjuncts(predicate):
+            supported_shape = (
+                isinstance(term, BinaryExpr) and term.operator.upper() in {"=", "<", "<=", ">", ">="}
+            ) or isinstance(term, (InExpr, BetweenExpr))
+            if not supported_shape:
+                continue
+            for column in _column_refs(term):
+                if column.table and column.table.casefold() != (ref.alias or ref.name).casefold():
+                    continue
+                if column.name.casefold() in available:
+                    found.append(available[column.name.casefold()])
+        return sorted(set(found))
 
-        plans = self.generate_candidate_plans()
+    def _join_condition_for_step(self, query, new_alias, joined_aliases, combined_aliases, applied):
+        applicable = []
+        for index, join in enumerate(query.joins):
+            if index in applied:
+                continue
+            condition_aliases = referenced_aliases(join.condition, self._active_aliases)
+            if new_alias not in condition_aliases:
+                continue
+            if not condition_aliases.issubset(combined_aliases):
+                continue
+            if not condition_aliases.intersection(joined_aliases):
+                # A single-table ON expression is not a join edge, but must still be applied.
+                if not (join.join_type == "CROSS" and not condition_aliases):
+                    continue
+            applicable.append((index, join))
+        return applicable
 
-        plans.sort(
-            key=lambda plan: plan.estimated_cost
-        )
+    def _equijoin_selectivity(self, conditions, aliases):
+        if not conditions:
+            return 1.0
+        fractions = []
+        for condition in conditions:
+            fractions.append(selectivity(condition, aliases))
+        result = 1.0
+        for fraction in fractions:
+            result *= max(0.00001, min(1.0, fraction))
+        return result
 
-        return plans
+    def _combine_conditions(self, conditions):
+        return " AND ".join(format_expr(condition) for condition in conditions) if conditions else "CROSS JOIN"
 
-    # =========================================================
-    # METADATA
-    # =========================================================
+    def _make_join(self, left, right, conditions, join_type, aliases):
+        left_rows, right_rows = max(1.0, left.rows), max(1.0, right.rows)
+        selectivity_fraction = self._equijoin_selectivity(conditions, aliases)
+        output_rows = max(1.0, left_rows * right_rows * selectivity_fraction)
+        if join_type in {"LEFT", "RIGHT"}:
+            output_rows = max(output_rows, left_rows if join_type == "LEFT" else right_rows)
 
-    def build_metadata(self):
-
-        query = self.query
-
-        self.table_aliases = {}
-
-        base_table = query.from_table
-
-        base_alias = (
-            base_table.alias
-            if base_table.alias
-            else base_table.name
-        )
-
-        self.table_aliases[base_alias] = base_table.name
-
-        self.table_rows[base_alias] = table_rows(
-            base_table.name
-        )
-
-        for join in query.joins:
-
-            table = join.table
-
-            alias = (
-                table.alias
-                if table.alias
-                else table.name
-            )
-
-            self.table_aliases[alias] = table.name
-
-            self.table_rows[alias] = table_rows(
-                table.name
-            )
-
-    # =========================================================
-    # SCAN SELECTION
-    # =========================================================
-
-    def choose_scan(self, table_name, alias):
-
-        rows = table_rows(table_name)
-
-        sequential_cost = self.cost_model.sequential_scan_cost(
-            rows
-        )
-
-        sequential = PlanNode(
-            operator="SEQ_SCAN",
-            properties={
-                "table": table_name,
-                "alias": alias
-            },
-            estimated_rows=float(rows),
-            estimated_cost=sequential_cost
-        )
-
-        # -----------------------------------------------------
-        # INDEX ALTERNATIVE
-        # -----------------------------------------------------
-
-        index_available = False
-
-        try:
-            columns = [
-                "id",
-                "dept_id",
-                "employee_id",
-                "project_id"
+        if join_type in {"LEFT", "RIGHT"}:
+            algorithm = "NESTED_LOOP"
+            join_cost = self.cost_model.nested_loop_join(left_rows, right_rows)
+        else:
+            options = [
+                ("NESTED_LOOP", self.cost_model.nested_loop_join(left_rows, right_rows)),
+                ("HASH_JOIN", self.cost_model.hash_join(left_rows, right_rows)),
+                ("MERGE_JOIN", self.cost_model.merge_join(left_rows, right_rows)),
             ]
-
-            for column in columns:
-                if has_index(table_name, column):
-                    index_available = True
-                    break
-
-        except Exception:
-            index_available = False
-
-        candidates = [sequential]
-
-        if index_available:
-
-            index_cost = self.cost_model.index_scan_cost(
-                rows
-            )
-
-            indexed = PlanNode(
-                operator="INDEX_SCAN",
-                properties={
-                    "table": table_name,
-                    "alias": alias
-                },
-                estimated_rows=float(rows),
-                estimated_cost=index_cost
-            )
-
-            candidates.append(indexed)
-
-        candidates.sort(
-            key=lambda plan: plan.estimated_cost
-        )
-
-        return candidates
-
-    # =========================================================
-    # SELECTIVITY
-    # =========================================================
-
-    def estimate_filter_selectivity(self, predicate):
-
-        try:
-            value = predicate_selectivity(predicate)
-
-            if value is None:
-                return 0.5
-
-            return max(
-                0.001,
-                min(1.0, float(value))
-            )
-
-        except Exception:
-            return 0.5
-
-    # =========================================================
-    # JOIN ALGORITHM
-    # =========================================================
-
-    def choose_join_algorithm(
-        self,
-        left_rows,
-        right_rows
-    ):
-
-        nested_cost = self.cost_model.nested_loop_cost(
-            left_rows,
-            right_rows
-        )
-
-        hash_cost = self.cost_model.hash_join_cost(
-            left_rows,
-            right_rows
-        )
-
-        merge_cost = self.cost_model.merge_join_cost(
-            left_rows,
-            right_rows
-        )
-
-        choices = [
-            (
-                "NESTED_LOOP_JOIN",
-                nested_cost
-            ),
-            (
-                "HASH_JOIN",
-                hash_cost
-            ),
-            (
-                "MERGE_JOIN",
-                merge_cost
-            )
-        ]
-
-        choices.sort(
-            key=lambda x: x[1]
-        )
-
-        return choices[0]
-
-    # =========================================================
-    # JOIN TREE
-    # =========================================================
-
-    def build_join_plan(self, order):
-
-        query = self.query
-
-        # -----------------------------------------------------
-        # BASE TABLE
-        # -----------------------------------------------------
-
-        base_alias = (
-            query.from_table.alias
-            if query.from_table.alias
-            else query.from_table.name
-        )
-
-        base_table = query.from_table.name
-
-        base_rows = table_rows(base_table)
-
-        base_cost = self.cost_model.sequential_scan_cost(
-            base_rows
-        )
-
-        current = PlanNode(
-            operator="TABLE_SCAN",
-            properties={
-                "table": base_table,
-                "alias": base_alias
-            },
-            estimated_rows=float(base_rows),
-            estimated_cost=base_cost
-        )
-
-        current_rows = float(base_rows)
-
-        # -----------------------------------------------------
-        # JOIN TABLES
-        # -----------------------------------------------------
-
-        join_map = {}
-
-        for join in query.joins:
-
-            alias = (
-                join.table.alias
-                if join.table.alias
-                else join.table.name
-            )
-
-            join_map[alias] = join
-
-        for alias in order:
-
-            if alias == base_alias:
-                continue
-
-            if alias not in join_map:
-                continue
-
-            join = join_map[alias]
-
-            table_name = join.table.name
-
-            right_rows = float(
-                table_rows(table_name)
-            )
-
-            algorithm, join_cost = (
-                self.choose_join_algorithm(
-                    current_rows,
-                    right_rows
-                )
-            )
-
-            # -------------------------------------------------
-            # JOIN SELECTIVITY
-            # -------------------------------------------------
-
-            join_selectivity = 0.1
-
-            estimated_join_rows = max(
-                1.0,
-                current_rows *
-                right_rows *
-                join_selectivity
-            )
-
-            node = PlanNode(
-                operator=algorithm,
-                children=[current],
-                properties={
-                    "table": table_name,
-                    "alias": alias,
-                    "condition": str(join.condition),
-                    "join_type": join.join_type
-                },
-                estimated_rows=estimated_join_rows,
-                estimated_cost=(
-                    current.estimated_cost
-                    + join_cost
-                )
-            )
-
-            current = node
-
-            current_rows = estimated_join_rows
-
-        # -----------------------------------------------------
-        # WHERE
-        # -----------------------------------------------------
-
-        if query.where:
-
-            selectivity = (
-                self.estimate_filter_selectivity(
-                    query.where
-                )
-            )
-
-            output_rows = max(
-                1.0,
-                current_rows * selectivity
-            )
-
-            filter_cost = self.cost_model.filter_cost(
-                current_rows,
-                output_rows
-            )
-
-            current = PlanNode(
-                operator="FILTER",
-                children=[current],
-                properties={
-                    "predicate": str(query.where)
-                },
-                estimated_rows=output_rows,
-                estimated_cost=(
-                    current.estimated_cost
-                    + filter_cost
-                )
-            )
-
-            current_rows = output_rows
-
-        # -----------------------------------------------------
-        # GROUP BY / AGGREGATION
-        # -----------------------------------------------------
-
-        if query.group_by:
-
-            output_rows = max(
-                1.0,
-                min(
-                    current_rows,
-                    current_rows * 0.2
-                )
-            )
-
-            aggregate_cost = (
-                self.cost_model.aggregate_cost(
-                    current_rows
-                )
-            )
-
-            current = PlanNode(
-                operator="AGGREGATE",
-                children=[current],
-                properties={
-                    "group_by": [
-                        str(x)
-                        for x in query.group_by
-                    ]
-                },
-                estimated_rows=output_rows,
-                estimated_cost=(
-                    current.estimated_cost
-                    + aggregate_cost
-                )
-            )
-
-            current_rows = output_rows
-
-        # -----------------------------------------------------
-        # HAVING
-        # -----------------------------------------------------
-
-        if query.having:
-
-            selectivity = (
-                self.estimate_filter_selectivity(
-                    query.having
-                )
-            )
-
-            output_rows = max(
-                1.0,
-                current_rows * selectivity
-            )
-
-            filter_cost = self.cost_model.filter_cost(
-                current_rows,
-                output_rows
-            )
-
-            current = PlanNode(
-                operator="HAVING",
-                children=[current],
-                properties={
-                    "predicate": str(query.having)
-                },
-                estimated_rows=output_rows,
-                estimated_cost=(
-                    current.estimated_cost
-                    + filter_cost
-                )
-            )
-
-            current_rows = output_rows
-
-        # -----------------------------------------------------
-        # ORDER BY
-        # -----------------------------------------------------
-
+            algorithm, join_cost = min(options, key=lambda item: item[1])
+        op = "JOIN" if join_type == "INNER" else f"{join_type}_JOIN"
+        condition_text = self._combine_conditions(conditions)
+        detail = f"{join_type} ON {condition_text}"
+        cumulative = left.cost + right.cost + join_cost
+        return PlanNode(op, [left, right], detail, output_rows, cumulative, algorithm)
+
+    def _estimate_group_rows(self, query, input_rows, aliases):
+        if not query.group_by:
+            return 1.0  # scalar aggregate such as COUNT(*)
+        estimate = 1.0
+        for expression in query.group_by:
+            if isinstance(expression, ColumnRef):
+                table = aliases.get(expression.table.casefold()) if expression.table else None
+                if table is None and not expression.table:
+                    matches = [name for name, columns in SCHEMA.items()
+                               if any(column.casefold() == expression.name.casefold() for column in columns)]
+                    if len(matches) == 1:
+                        table = matches[0]
+                stats = STATS.get(table, {}).get("columns", {}).get(expression.name.casefold(), {}) if table else {}
+                estimate *= max(1.0, float(stats.get("distinct", max(1.0, input_rows * 0.25))))
+            else:
+                estimate *= max(1.0, input_rows * 0.25)
+        return max(1.0, min(input_rows, estimate))
+
+    def _build_candidate(self, query, order, scans, remaining_where, aliases):
+        current = scans[(order[0].alias or order[0].name).casefold()]
+        joined = {(order[0].alias or order[0].name).casefold()}
+        applied_join_indexes = set()
+        # If outer/cross joins are present, order is fixed and ON semantics are retained.
+        fixed_join_order = any(j.join_type != "INNER" for j in query.joins)
+        for ref in order[1:]:
+            new_alias = (ref.alias or ref.name).casefold()
+            combined = joined | {new_alias}
+            applicable = self._join_condition_for_step(query, new_alias, joined, combined, applied_join_indexes)
+            conditions = [join.condition for _, join in applicable]
+            join_type = "INNER"
+            if fixed_join_order:
+                # The incoming relation follows its original JoinClause; do not commute outer joins.
+                match = next((j for j in query.joins if (j.table.alias or j.table.name).casefold() == new_alias), None)
+                join_type = match.join_type if match else "INNER"
+                if join_type == "CROSS":
+                    conditions = []
+                elif not conditions and match:
+                    conditions = [match.condition]
+            for index, _ in applicable:
+                applied_join_indexes.add(index)
+            right = scans[new_alias]
+            current = self._make_join(current, right, conditions, join_type, aliases)
+            joined.add(new_alias)
+
+        # Any ON expression that could not be attached during reordering is retained as a filter.
+        residual_on = [join.condition for i, join in enumerate(query.joins) if i not in applied_join_indexes and join.join_type == "INNER"]
+        if residual_on:
+            residual = combine_conjuncts(residual_on)
+            fraction = selectivity(residual, aliases)
+            rows = max(1.0, current.rows * fraction)
+            cost = current.cost + self.cost_model.predicate(current.rows)
+            current = PlanNode("FILTER", [current], f"join predicates: {format_expr(residual)}", rows, cost)
+        if remaining_where:
+            predicate = combine_conjuncts(remaining_where)
+            rows = max(1.0, current.rows * selectivity(predicate, aliases))
+            cost = current.cost + self.cost_model.predicate(current.rows)
+            current = PlanNode("FILTER", [current], format_expr(predicate), rows, cost)
+
+        aggregate_query = bool(query.group_by) or any(contains_aggregate(item.expression) for item in query.columns) or contains_aggregate(query.having)
+        if aggregate_query:
+            output_rows = self._estimate_group_rows(query, current.rows, aliases)
+            output_rows = max(1.0, min(current.rows, output_rows)) if query.group_by else 1.0
+            group_by = ", ".join(format_expr(x) for x in query.group_by) or "global aggregate"
+            cost = current.cost + self.cost_model.aggregate(current.rows)
+            current = PlanNode("HASH_AGGREGATE", [current], group_by, output_rows, cost, "HASH")
+        if query.having is not None:
+            rows = max(1.0, current.rows * selectivity(query.having, aliases))
+            cost = current.cost + self.cost_model.predicate(current.rows)
+            current = PlanNode("HAVING_FILTER", [current], format_expr(query.having), rows, cost)
+        if query.distinct:
+            rows = max(1.0, current.rows * 0.5)
+            cost = current.cost + self.cost_model.distinct(current.rows)
+            current = PlanNode("DISTINCT", [current], "remove duplicate rows", rows, cost)
         if query.order_by:
-
-            sort_cost = self.cost_model.sort_cost(
-                current_rows
-            )
-
-            current = PlanNode(
-                operator="SORT",
-                children=[current],
-                properties={
-                    "order_by": [
-                        str(x)
-                        for x in query.order_by
-                    ]
-                },
-                estimated_rows=current_rows,
-                estimated_cost=(
-                    current.estimated_cost
-                    + sort_cost
-                )
-            )
-
-        # -----------------------------------------------------
-        # LIMIT
-        # -----------------------------------------------------
-
+            details = ", ".join(f"{format_expr(item.expression)} {item.direction}" for item in query.order_by)
+            cost = current.cost + self.cost_model.sort(current.rows)
+            current = PlanNode("SORT", [current], details, current.rows, cost)
         if query.limit is not None:
+            current = PlanNode("LIMIT", [current], str(query.limit), min(current.rows, float(query.limit)), current.cost)
+        projection = ", ".join(format_expr(item.expression) for item in query.columns)
+        return PlanNode("PROJECT", [current], projection, current.rows, current.cost + self.cost_model.project(current.rows))
 
-            output_rows = min(
-                current_rows,
-                float(query.limit)
-            )
+    def enumerate_plans(self, query):
+        aliases = self._alias_map(query)
+        self._active_aliases = aliases
+        tables = ([query.table] if query.table else []) + [join.table for join in query.joins]
+        scans, remaining_where = self._base_scans(query, aliases)
+        fixed_order = any(join.join_type != "INNER" for join in query.joins)
+        if fixed_order or len(tables) <= 1:
+            orders = [tables]
+        else:
+            orders = itertools.permutations(tables)
 
-            current = PlanNode(
-                operator="LIMIT",
-                children=[current],
-                properties={
-                    "limit": query.limit
-                },
-                estimated_rows=output_rows,
-                estimated_cost=current.estimated_cost
-            )
-
-            current_rows = output_rows
-
-        # -----------------------------------------------------
-        # PROJECTION
-        # -----------------------------------------------------
-
-        current = PlanNode(
-            operator="PROJECT",
-            children=[current],
-            properties={
-                "columns": len(
-                    query.select_items
-                )
-            },
-            estimated_rows=current_rows,
-            estimated_cost=current.estimated_cost
-        )
-
-        return current
-
-    # =========================================================
-    # PLAN GENERATION
-    # =========================================================
-
-    def generate_candidate_plans(self):
-
-        query = self.query
-
-        aliases = []
-
-        base_alias = (
-            query.from_table.alias
-            if query.from_table.alias
-            else query.from_table.name
-        )
-
-        aliases.append(base_alias)
-
-        for join in query.joins:
-
-            alias = (
-                join.table.alias
-                if join.table.alias
-                else join.table.name
-            )
-
-            aliases.append(alias)
-
-        # -----------------------------------------------------
-        # Generate different join orders
-        # -----------------------------------------------------
-
-        unique_orders = list(
-            permutations(aliases)
-        )
-
-        plans = []
-
-        for order in unique_orders:
-
-            try:
-
-                plan = self.build_join_plan(
-                    order
-                )
-
-                plans.append(plan)
-
-            except Exception:
+        results = []
+        signatures = set()
+        for order_index, order in enumerate(orders):
+            if order_index >= self.max_join_orders:
+                break
+            candidate = self._build_candidate(query, list(order), scans, remaining_where, aliases)
+            signature = tuple((ref.alias or ref.name).casefold() for ref in order)
+            if signature in signatures:
                 continue
+            signatures.add(signature)
+            results.append(candidate)
+        return sorted(results, key=lambda plan: plan.cost)[:self.max_candidates]
 
-        # -----------------------------------------------------
-        # Remove duplicate costs
-        # -----------------------------------------------------
 
-        unique_plans = []
-
-        seen = set()
-
-        for plan in plans:
-
-            key = round(
-                plan.estimated_cost,
-                6
-            )
-
-            if key not in seen:
-
-                seen.add(key)
-                unique_plans.append(plan)
-
-        unique_plans.sort(
-            key=lambda p: p.estimated_cost
-        )
-
-        return unique_plans
+def optimize(query):
+    return Optimizer().optimize(query)

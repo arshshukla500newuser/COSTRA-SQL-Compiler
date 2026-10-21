@@ -1,0 +1,1 @@
+# COSTRA uses only the Python standard library. No pip install is required.
