@@ -6,3 +6,7 @@ venv/
 .vscode/.ropeproject/
 .coverage
 htmlcov/
+
+# Generated benchmark results
+reports/
+.vscode/

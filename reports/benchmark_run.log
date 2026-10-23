@@ -1,6 +1,0 @@
-Wrote reports/benchmark_results.json
-Wrote reports/benchmark_results.csv
-multi_join_aggregation: median 1.7283 ms, 3 rows, estimated cost 115222.63 model units
-indexed_salary_filter: median 0.1520 ms, 2 rows, estimated cost 27791.10 model units
-grouped_department_counts: median 0.2551 ms, 4 rows, estimated cost 20507.00 model units
-distinct_departments: median 0.0837 ms, 4 rows, estimated cost 34753.50 model units
